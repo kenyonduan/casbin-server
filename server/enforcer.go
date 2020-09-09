@@ -16,7 +16,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"io/ioutil"
 	"strings"
 
@@ -24,62 +23,54 @@ import (
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
+	fileadapter "github.com/casbin/casbin/v2/persist/file-adapter"
+	gormadapter "github.com/casbin/gorm-adapter/v2"
 )
 
 // Server is used to implement proto.CasbinServer.
 type Server struct {
-	enforcerMap map[int]*casbin.Enforcer
-	adapterMap  map[int]persist.Adapter
+	enforcer *casbin.Enforcer
+	adapter  persist.Adapter
 }
 
 func NewServer() *Server {
 	s := Server{}
 
-	s.enforcerMap = map[int]*casbin.Enforcer{}
-	s.adapterMap = map[int]persist.Adapter{}
+	// 加载配置文件
+	cfg := LoadConfiguration("config/connection_config.json")
+
+	// 初始化 adapter
+	var err error
+	switch cfg.Driver {
+	case "file":
+		s.adapter = fileadapter.NewAdapter(cfg.Connection)
+	default:
+		s.adapter, err = gormadapter.NewAdapter(cfg.Driver, cfg.Connection, cfg.DBSpecified)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// 初始化 enforcer
+	data, err := ioutil.ReadFile(cfg.Enforcer)
+	if err != nil {
+		panic(err)
+	}
+	m, err := model.NewModelFromString(string(data))
+	if err != nil {
+		panic(err)
+	}
+	s.enforcer, err = casbin.NewEnforcer(m, s.adapter)
+	if err != nil {
+		panic(err)
+	}
 
 	return &s
 }
 
-func (s *Server) getEnforcer(handle int) (*casbin.Enforcer, error) {
-	if _, ok := s.enforcerMap[handle]; ok {
-		return s.enforcerMap[handle], nil
-	} else {
-		return nil, errors.New("enforcer not found")
-	}
-}
-
-func (s *Server) getAdapter(handle int) (persist.Adapter, error) {
-	if _, ok := s.adapterMap[handle]; ok {
-		return s.adapterMap[handle], nil
-	} else {
-		return nil, errors.New("adapter not found")
-	}
-}
-
-func (s *Server) addEnforcer(e *casbin.Enforcer) int {
-	cnt := len(s.enforcerMap)
-	s.enforcerMap[cnt] = e
-	return cnt
-}
-
-func (s *Server) addAdapter(a persist.Adapter) int {
-	cnt := len(s.adapterMap)
-	s.adapterMap[cnt] = a
-	return cnt
-}
-
 func (s *Server) NewEnforcer(ctx context.Context, in *pb.NewEnforcerRequest) (*pb.NewEnforcerReply, error) {
-	var a persist.Adapter
+	var a = s.adapter
 	var e *casbin.Enforcer
-
-	if in.AdapterHandle != -1 {
-		var err error
-		a, err = s.getAdapter(int(in.AdapterHandle))
-		if err != nil {
-			return &pb.NewEnforcerReply{Handler: 0}, err
-		}
-	}
 
 	if in.ModelText == "" {
 		cfg := LoadConfiguration("config/connection_config.json")
@@ -111,9 +102,9 @@ func (s *Server) NewEnforcer(ctx context.Context, in *pb.NewEnforcerRequest) (*p
 			return &pb.NewEnforcerReply{Handler: 0}, err
 		}
 	}
-	h := s.addEnforcer(e)
+	s.enforcer = e
 
-	return &pb.NewEnforcerReply{Handler: int32(h)}, nil
+	return &pb.NewEnforcerReply{Handler: 0}, nil
 }
 
 func (s *Server) NewAdapter(ctx context.Context, in *pb.NewAdapterRequest) (*pb.NewAdapterReply, error) {
@@ -121,10 +112,9 @@ func (s *Server) NewAdapter(ctx context.Context, in *pb.NewAdapterRequest) (*pb.
 	if err != nil {
 		return nil, err
 	}
+	s.adapter = a
 
-	h := s.addAdapter(a)
-
-	return &pb.NewAdapterReply{Handler: int32(h)}, nil
+	return &pb.NewAdapterReply{Handler: 0}, nil
 }
 
 func (s *Server) parseParam(param, matcher string) (interface{}, string) {
@@ -146,20 +136,16 @@ func (s *Server) parseParam(param, matcher string) (interface{}, string) {
 }
 
 func (s *Server) Enforce(ctx context.Context, in *pb.EnforceRequest) (*pb.BoolReply, error) {
-	e, err := s.getEnforcer(int(in.EnforcerHandler))
-	if err != nil {
-		return &pb.BoolReply{Res: false}, err
-	}
 	var param interface{}
 	params := make([]interface{}, 0, len(in.Params))
-	m := e.GetModel()["m"]["m"].Value
+	m := s.enforcer.GetModel()["m"]["m"].Value
 
 	for index := range in.Params {
 		param, m = s.parseParam(in.Params[index], m)
 		params = append(params, param)
 	}
 
-	res, err := e.EnforceWithMatcher(m, params...)
+	res, err := s.enforcer.EnforceWithMatcher(m, params...)
 	if err != nil {
 		return &pb.BoolReply{Res: false}, err
 	}
@@ -168,23 +154,11 @@ func (s *Server) Enforce(ctx context.Context, in *pb.EnforceRequest) (*pb.BoolRe
 }
 
 func (s *Server) LoadPolicy(ctx context.Context, in *pb.EmptyRequest) (*pb.EmptyReply, error) {
-	e, err := s.getEnforcer(int(in.Handler))
-	if err != nil {
-		return &pb.EmptyReply{}, err
-	}
-
-	err = e.LoadPolicy()
-
+	err := s.enforcer.LoadPolicy()
 	return &pb.EmptyReply{}, err
 }
 
 func (s *Server) SavePolicy(ctx context.Context, in *pb.EmptyRequest) (*pb.EmptyReply, error) {
-	e, err := s.getEnforcer(int(in.Handler))
-	if err != nil {
-		return &pb.EmptyReply{}, err
-	}
-
-	err = e.SavePolicy()
-
+	err := s.enforcer.SavePolicy()
 	return &pb.EmptyReply{}, err
 }
